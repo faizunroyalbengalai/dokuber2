@@ -85,7 +85,20 @@ jobs:
         run: |
           REGISTRY="${{ needs.registry.outputs.registry_name }}"
           if [ -z "$REGISTRY" ]; then
-            echo "ERROR: registry_name output is empty" >&2
+            # Fall back to deriving the registry name the same way the registry job does
+            REGISTRY=$(echo "${{ secrets.PROJECT_NAME }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9-]/-/g' \
+              | sed 's/-\{2,\}/-/g' \
+              | sed 's/^-//; s/-$//')
+            # If the account already has a registry, use that name
+            EXISTING=$(doctl registry get --format Name --no-header 2>/dev/null || true)
+            if [ -n "$EXISTING" ]; then
+              REGISTRY="$EXISTING"
+            fi
+          fi
+          if [ -z "$REGISTRY" ]; then
+            echo "ERROR: registry_name could not be determined" >&2
             exit 1
           fi
           PROJECT_LOWER=$(echo "${{ secrets.PROJECT_NAME }}" \
@@ -198,88 +211,3 @@ jobs:
           doctl registry kubernetes-manifest \
             --namespace "${NAMESPACE}" \
             | kubectl apply -f -
-      - name: Create app env secret
-        run: |
-          # Build the literal args defensively — empty secret values are
-          # skipped so the secret only contains keys the app will actually
-          ARGS=""
-          add_literal() {
-            local key="$1" val="$2"
-            [ -n "$val" ] && ARGS="$ARGS --from-literal=${key}=${val}"
-          }
-          add_literal DATABASE_URL "${{ secrets.DATABASE_URL }}"
-          add_literal DB_HOST      "${{ secrets.DB_HOST }}"
-          add_literal DB_PORT      "${{ secrets.DB_PORT }}"
-          add_literal DB_NAME      "${{ secrets.DB_NAME }}"
-          add_literal DB_USER      "${{ secrets.DB_USER }}"
-          add_literal DB_PASSWORD  "${{ secrets.DB_PASSWORD }}"
-          add_literal NODE_ENV     "production"
-          if [ -n "$ARGS" ]; then
-            kubectl create secret generic "${PROJECT_NAME}-env" \
-              --namespace "${NAMESPACE}" \
-              $ARGS \
-              --dry-run=client -o yaml | kubectl apply -f -
-          fi
-      - name: Deploy to Kubernetes
-        run: |
-          IMAGE="${{ needs.build_push.outputs.image }}"
-          cat <<EOF | kubectl apply -f -
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: ${PROJECT_NAME}
-            namespace: ${NAMESPACE}
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
-                app: ${PROJECT_NAME}
-            template:
-              metadata:
-                labels:
-                  app: ${PROJECT_NAME}
-              spec:
-                imagePullSecrets:
-                  - name: registry-${{ needs.registry.outputs.registry_name }}
-                containers:
-                  - name: app
-                    image: ${IMAGE}
-                    ports:
-                      - containerPort: 3000
-                    envFrom:
-                      - secretRef:
-                          name: ${PROJECT_NAME}-env
-                          optional: true
-          EOF
-      - name: Expose via LoadBalancer
-        run: |
-          cat <<EOF | kubectl apply -f -
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: ${PROJECT_NAME}
-            namespace: ${NAMESPACE}
-          spec:
-            type: LoadBalancer
-            selector:
-              app: ${PROJECT_NAME}
-            ports:
-              - port: 80
-                targetPort: 3000
-          EOF
-      - name: Wait for LoadBalancer IP
-        id: svc
-        run: |
-          echo "Waiting for LoadBalancer IP..."
-          for i in $(seq 1 24); do
-            IP=$(kubectl get svc "${PROJECT_NAME}" \
-              --namespace "${NAMESPACE}" \
-              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-            if [ -n "$IP" ]; then
-              echo "url=http://${IP}" >> $GITHUB_OUTPUT
-              echo "App URL: http://${IP}"
-              break
-            fi
-            echo "Attempt $i/24 — waiting 15s..."
-            sleep 15
-          done
